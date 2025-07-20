@@ -1,0 +1,11 @@
+[package]
+name = "crytt"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+base64 = "0.22.1"
+p256 = "0.13.2"
+spki = "0.7.3"
+rand = "0.8.0"
+rsa = "0.9.8"
