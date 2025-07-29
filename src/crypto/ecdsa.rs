@@ -21,12 +21,14 @@ pub fn generate_keypair() -> EcdsaKeyPair {
     EcdsaKeyPair { pkey, skey }
 }
 
-pub fn load_keypair(spath: &str, ppath: &str, buf: &mut Vec<u8>) -> Result<EcdsaKeyPair, Error> {
-    read_file(spath, buf)?;
-    let skey = skey_from_base64(buf)?;
+pub fn load_keypair(spath: &str, ppath: &str) -> Result<EcdsaKeyPair, Error> {
+    let mut buf = Vec::new();
+    read_file(spath, &mut buf)?;
+    let skey = skey_from_base64(&mut buf)?;
 
-    read_file(ppath, buf)?;
-    let pkey = pkey_from_base64(buf)?;
+    let mut buf = Vec::new();
+    read_file(ppath, &mut buf)?;
+    let pkey = pkey_from_base64(&mut buf)?;
 
     Ok(EcdsaKeyPair { pkey, skey })
 }

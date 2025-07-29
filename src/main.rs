@@ -1,7 +1,6 @@
 use base64::{Engine as _, engine::general_purpose};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
-use serde_json::Serializer;
 use std::{
     collections::HashMap,
     fs::{self, File},
@@ -10,16 +9,16 @@ use std::{
 
 mod crypto;
 use aes_gcm::{
-    AeadCore, Aes256Gcm, Key,
-    aead::{AeadMutInPlace, KeyInit, OsRng},
+    AeadCore, Aes256Gcm, Key, Nonce, Tag,
+    aead::{Aead, AeadMutInPlace, KeyInit, OsRng},
 };
 use crypto::ecdsa::EcdsaKeyPair;
 use crypto::rsa::RsaKeyPair;
 use crypto::{ecdsa, rsa};
 
-use ::rsa::{Oaep, RsaPublicKey, pkcs1::EncodeRsaPublicKey, signature::SignerMut};
-use mosquitto_rs::{Client, ConnectionStatus, Event, QoS}; // Import QoS
-use p256::ecdsa::signature::Verifier; // You might need to import Signature and Verifier traits
+use ::rsa::{Oaep, RsaPublicKey, signature::SignerMut};
+use mosquitto_rs::{Client, Event, QoS};
+use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -32,12 +31,13 @@ const ECDSA_SKEY_FILE: &str = "ecdsa_key";
 const ECDSA_PKEY_FILE: &str = "ecdsa_key.pub";
 const ECDSA_TARGETS_PKEY_FOLDER: &str = "targets_ecdsa";
 
-const TOPIC_REVOKE: &str = "jvsl/sisdef/broadcast/revogacao";
-const TOPIC_BROADCAST_KEYS: &str = "jvsl/sisdef/broadcast/chaves";
-const TOPIC_DM: &str = "jvsl/sisdef/direto";
+const TOPIC_REVOKE: &str = "sisdef/broadcast/revogacao";
+const TOPIC_BROADCAST_KEYS: &str = "sisdef/broadcast/chaves";
+const TOPIC_DM: &str = "sisdef/direto";
 
 #[derive(Debug, Clone)]
 enum Command {
+    SaveMessage(ReceivedDirectMessage),
     PublishIdentity(String),
     Refresh,
     RequestRevoke(String, String),
@@ -109,8 +109,25 @@ struct PublicIdentityMessage {
     chave_publica_eddsa: String,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct ReceivedDirectMessage {
+    remetente: String,
+    ciphertext_b64: String,
+    tag_autenticacao_b64: String,
+    nonce_b64: String,
+    chave_sessao_cifrada_b64: String,
+    assinatura_b64: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Getting user info
+    let mut codename = String::new();
+    print!("Insert codename: ");
+    io::stdout().flush()?;
+    io::stdin().read_line(&mut codename)?;
+    let codename = codename.trim().to_string(); // Trim here
+
     let (ui_tx, mut ui_rx) = tokio::sync::mpsc::channel(32);
     let (background_tx, background_rx) = tokio::sync::mpsc::channel(32);
     let background_tx_clone = background_tx.clone();
@@ -120,147 +137,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. MQTT Handler Task
     let mqtt_broker_address = "test.mosquitto.org";
     let mqtt_broker_port = 1883;
+    let codename_clone = codename.clone();
 
     let mqtt_handle = tokio::spawn(async move {
-        let client = Client::with_auto_id().expect("Failed to create Mosquitto client");
-        let subscriptions = client
-            .subscriber()
-            .expect("Failed to get subscriber handle");
-
-        let mut is_connected = false;
-        loop {
-            // Attempt to connect if not connected
-            if !is_connected {
-                println!(
-                    "Attempting connection to Mosquitto at {}:{}",
-                    mqtt_broker_address, mqtt_broker_port
-                );
-                match client
-                    .connect(
-                        mqtt_broker_address,
-                        mqtt_broker_port,
-                        std::time::Duration::from_secs(5),
-                        None, // No user data for now
-                    )
-                    .await
-                {
-                    Ok(_) => {
-                        is_connected = true;
-                        println!("Connection to Mosquitto successful: {:?}", is_connected);
-                        if let Err(e) = client.subscribe(TOPIC_REVOKE, QoS::ExactlyOnce).await {
-                            eprintln!("Failed to subscribe to {}: {:?}", TOPIC_REVOKE, e);
-                        }
-                        println!("{}", format!("subscribed to: {}", TOPIC_REVOKE));
-                        if let Err(e) = client
-                            .subscribe(
-                                format!("{}/+", TOPIC_BROADCAST_KEYS).as_str(),
-                                QoS::ExactlyOnce,
-                            )
-                            .await
-                        {
-                            eprintln!(
-                                "Failed to subscribe to {}: {:?}",
-                                format!("{}/+", TOPIC_BROADCAST_KEYS),
-                                e
-                            );
-                        }
-                        println!("{}", format!("subscribed to: {}/+", TOPIC_BROADCAST_KEYS));
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to connect to Mosquitto: {:?}", e);
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await; // Wait before retrying
-                        continue;
-                    }
-                }
-            }
-
-            tokio::select! {
-                // Handle incoming MQTT messages
-                Ok(evt) = subscriptions.recv() => {
-                    match evt {
-                        Event::Message(msg) => {
-                            if msg.topic == TOPIC_REVOKE {
-                                match serde_json::from_slice(msg.payload.as_slice()) {
-                                    Ok(data) => {
-                                        background_tx_clone.send(Command::RevokeKey(data)).await.unwrap();
-                                    },
-                                    Err(_) => println!("Failed to parse broadcast keys json to struct"),
-                                }
-                            } else if msg.topic.split_at(TOPIC_BROADCAST_KEYS.len()).0 == TOPIC_BROADCAST_KEYS {
-                                println!("{}", String::from_utf8(msg.clone().payload).unwrap());
-                                match serde_json::from_slice(msg.payload.as_slice()) {
-                                    Ok(data) => {
-                                        background_tx_clone.send(Command::MqttAddPublicKey(data)).await.unwrap();
-                                    },
-                                    Err(_) => println!("Failed to parse broadcast keys json to struct"),
-                                }
-                            }
-                            // Handle other messages here
-                        }
-                        Event::Connected(status) => {
-                            is_connected = true;
-                            println!("MQTT Client Event: Connected: {:?}", is_connected);
-                        }
-                        Event::Disconnected(reason_code) => {
-                            is_connected = false;
-                            println!("MQTT Client Event: Disconnected: {:?}. Attempting reconnect...", reason_code);
-                            // The outer loop will handle reconnection after a small delay
-                        }
-                    }
-                },
-                // Handle commands from other tasks (e.g., publish requests)
-                Some(cmd) = mqtt_rx.recv() => {
-                    match cmd {
-                        MqttCommand::Publish { topic, payload, qos, retain } => {
-                            if is_connected {
-                                println!("MQTT Handler: Publishing to '{}'", topic);
-                                if let Err(e) = client.publish(topic, payload, qos, retain).await {
-                                    eprintln!("MQTT Handler: Failed to publish: {:?}", e);
-                                    // You might send an error back to the origin if needed
-                                }
-                            } else {
-                                is_connected = false;
-                                eprintln!("MQTT Handler: Cannot publish, not connected.");
-                                // You might queue messages or send an error back
-                            }
-                        },
-                        MqttCommand::Subscribe { topic, qos } => {
-                            if is_connected {
-                                println!("MQTT Handler: Subscribing to '{}'", topic);
-                                if let Err(e) = client.subscribe(&topic, qos).await {
-                                    eprintln!("MQTT Handler: Failed to subscribe: {:?}", e);
-                                }
-                            } else {
-                                is_connected = false;
-                                eprintln!("MQTT Handler: Cannot subscribe, not connected.");
-                            }
-                        },
-                    }
-                },
-                else => break,
-            }
-        }
+        mqtt_handle(
+            mqtt_broker_address,
+            mqtt_broker_port,
+            &codename_clone,
+            background_tx_clone,
+            &mut mqtt_rx,
+        )
+        .await
+        .unwrap();
     });
 
-    let background_tx_clone = background_tx.clone();
     let background_handle = tokio::spawn(async move {
-        // Pass mqtt_tx into the background function
-        background(ui_tx, background_rx, mqtt_tx, background_tx_clone)
-            .await
-            .unwrap();
+        background(ui_tx, background_rx, mqtt_tx).await.unwrap();
     });
-
-    // Getting user info
-    let mut codename = String::new();
-    print!("Insert codename: ");
-    io::stdout().flush()?;
-    io::stdin().read_line(&mut codename)?;
-    let codename = codename.trim().to_string(); // Trim here
 
     background_tx.send(Command::Refresh).await.unwrap();
 
     // App loop
-    let mut state;
     let mut user_command = Command::Refresh;
     loop {
         // Clear terminal
@@ -274,13 +171,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "Failed to get response from background",
             )));
         match msg {
-            CommandOutput::State(s) => state = s,
+            CommandOutput::State(_) => {}
             CommandOutput::Error(msg) => {
                 println!("{}", msg);
-                break;
-            }
-            other => {
-                println!("Unexpected response message: {:?}", other);
                 break;
             }
         }
@@ -328,24 +221,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn background(
     command_output: Sender<CommandOutput>,
     mut command: Receiver<Command>,
-    mqtt_tx: Sender<MqttCommand>, // NEW: Pass the MQTT command sender
-    background_tx_clone: Sender<Command>, // Keep this if needed for RevokeKey
+    mqtt_tx: Sender<MqttCommand>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut buf: Vec<u8> = Vec::new();
-
-    // Key loading (unchanged)
-    let mut ecdsa_key_pair = match ecdsa::load_keypair(ECDSA_SKEY_FILE, ECDSA_PKEY_FILE, &mut buf) {
+    let ecdsa_key_pair = match ecdsa::load_keypair(ECDSA_SKEY_FILE, ECDSA_PKEY_FILE) {
         Ok(kp) => kp,
-        Err(_) => {
+        Err(e) => {
+            println!("{:?}", e);
             let kp = ecdsa::generate_keypair();
             ecdsa::export_keypair_to_file(&kp, ECDSA_SKEY_FILE, ECDSA_PKEY_FILE).unwrap();
             kp
         }
     };
 
-    let mut rsa_key_pair = match rsa::load_keypair(RSA_SKEY_FILE, RSA_PKEY_FILE, &mut buf) {
+    let rsa_key_pair = match rsa::load_keypair(RSA_SKEY_FILE, RSA_PKEY_FILE) {
         Ok(kp) => kp,
-        Err(_) => {
+        Err(e) => {
+            println!("{:?}", e);
             let kp = rsa::generate_keypair(RSA_SIZE).unwrap();
             rsa::export_keypair_to_file(&kp, RSA_SKEY_FILE, RSA_PKEY_FILE).unwrap();
             kp
@@ -366,13 +257,18 @@ async fn background(
 
     while let Some(msg) = command.recv().await {
         match msg {
+            Command::SaveMessage(data) => {
+                if !revoked.contains_key(&data.remetente) {
+                    handle_direct_message(data, &state, &target_ecdsa_pub_keys, &revoked).unwrap();
+                } else {
+                    println!(
+                        "Revoked {} is trying to send messages! DO NOT LISTEN TO THEM",
+                        &data.remetente
+                    );
+                }
+            }
             Command::MqttAddPublicKey(data) => {
-                mqtt_add_public_keys(
-                    data,
-                    &mut revoked,
-                    &target_rsa_pub_keys,
-                    &mut target_ecdsa_pub_keys,
-                );
+                mqtt_add_public_keys(data, &revoked, &target_rsa_pub_keys, &target_ecdsa_pub_keys);
             }
             Command::ReloadPublicKeys => {
                 setup_pkeys_and_revokes(
@@ -385,7 +281,12 @@ async fn background(
             Command::RevokeKey(payload) => {
                 if should_revoke_key(&payload, &mut target_ecdsa_pub_keys) {
                     revoked.insert(payload.revogacao.unidade_revogada.clone(), true);
-                    let json = serde_json::to_string(&revoked).unwrap();
+                    let revoked_keys: Vec<String> =
+                        revoked.iter().map(|(k, _)| k.clone()).collect();
+                    let json = serde_json::to_string(&RevokedKeys {
+                        revoked: revoked_keys,
+                    })
+                    .unwrap();
 
                     let mut file = File::create("revoked.keys")
                         .expect("Failed to create file for revoked.keys: {}");
@@ -444,11 +345,10 @@ async fn background(
 
 fn mqtt_add_public_keys(
     data: PublicIdentityMessage,
-    revoked: &mut HashMap<String, bool>,
+    revoked: &HashMap<String, bool>,
     target_rsa_pub_keys: &HashMap<String, RsaPublicKey>,
-    target_ecdsa_pub_keys: &mut HashMap<String, VerifyingKey>,
+    target_ecdsa_pub_keys: &HashMap<String, VerifyingKey>,
 ) {
-    println!("{:?}", &data);
     if !revoked.contains_key(&data.id_unidade)
         && !target_rsa_pub_keys.contains_key(&data.id_unidade)
         && !target_ecdsa_pub_keys.contains_key(&data.id_unidade)
@@ -563,7 +463,6 @@ async fn publish_identity(
             retain: true,
         })
         .await?;
-
     Ok(())
 }
 
@@ -595,7 +494,7 @@ async fn send_message(
 
     let chave_sessao_cifrada =
         target_rsa_pkey.encrypt(&mut OsRng, Oaep::new::<Sha256>(), &key.to_vec())?;
-    let chave_sessao_cifrada_b64 = general_purpose::STANDARD.encode(chave_sessao_cifrada.to_vec());
+    let chave_sessao_cifrada_b64 = general_purpose::STANDARD.encode(chave_sessao_cifrada);
 
     let json = format!(
         "{{\"remetente\":\"{}\",\"ciphertext_b64\":\"{}\",\"tag_autenticacao_b64\":\"{}\",\"nonce_b64\":\"{}\",\"chave_sessao_cifrada_b64\":\"{}\",\"assinatura_b64\":\"{}\"}}",
@@ -630,7 +529,11 @@ fn should_revoke_key(
         hasher.update(&json_str);
         let result = hasher.finalize();
 
-        let s: Signature = Signature::from_slice(&payload.assinatura_b64.as_bytes()).unwrap();
+        let assinatura = general_purpose::STANDARD
+            .decode(&payload.assinatura_b64)
+            .unwrap();
+
+        let s: Signature = Signature::from_slice(&assinatura).unwrap();
 
         match key.verify(&result, &s) {
             Ok(_) => true,
@@ -642,12 +545,11 @@ fn should_revoke_key(
     }
 }
 
-// Update `request_revoke` to take Sender<MqttCommand>
 async fn request_revoke(
     target: &String,
     codename: &String,
     state: &mut State,
-    mqtt_tx: &Sender<MqttCommand>, // Changed type
+    mqtt_tx: &Sender<MqttCommand>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let now = Local::now();
     let iso_8601_string = now.to_rfc3339();
@@ -660,12 +562,14 @@ async fn request_revoke(
     let mut hasher = Sha256::new();
     hasher.update(&json_msg);
     let result = hasher.finalize();
-    let signed: Signature = state.ecdsa_key_pair.skey.sign(&result.to_vec());
+    let signed: Signature = state.ecdsa_key_pair.skey.sign(&result);
+
+    let assinatura_b64 = general_purpose::STANDARD.encode(signed.to_vec());
 
     let msg = RevokeMessage {
         remetente: codename.clone(),
         revogacao: content,
-        assinatura_b64: signed.to_string(),
+        assinatura_b64,
     };
     let json_msg = serde_json::to_string(&msg).unwrap();
 
@@ -675,7 +579,7 @@ async fn request_revoke(
             topic: TOPIC_REVOKE.to_string(),
             payload: json_msg,
             qos: QoS::ExactlyOnce,
-            retain: true, // Assuming revoke messages are retained
+            retain: false, // Assuming revoke messages are retained
         })
         .await?;
 
@@ -686,19 +590,43 @@ fn encrypt_aes256_gcm(
     key: &Key<Aes256Gcm>,
     plaintext: &[u8],
 ) -> Result<(String, String, String), String> {
-    let mut cipher = Aes256Gcm::new(key);
+    let cipher = Aes256Gcm::new(key);
     let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
 
-    let mut ciphertext = Vec::new();
-    let tag = cipher
-        .encrypt_in_place_detached(&nonce, plaintext, &mut ciphertext)
+    let ciphertext = cipher
+        .encrypt(&nonce, plaintext)
         .map_err(|e| format!("Encryption error: {:?}", e))?;
 
-    let base64_ciphertext = general_purpose::STANDARD.encode(&ciphertext);
-    let base64_tag = general_purpose::STANDARD.encode(&tag.to_vec());
-    let base64_nonce = general_purpose::STANDARD.encode(&nonce.to_vec());
+    // The encrypt method appends the 16-byte authentication tag to the ciphertext.
+    // We need to split them before Base64 encoding.
+    let (actual_ciphertext, tag) = ciphertext.split_at(ciphertext.len() - 16);
+
+    let base64_ciphertext = general_purpose::STANDARD.encode(actual_ciphertext);
+    let base64_tag = general_purpose::STANDARD.encode(tag);
+    let base64_nonce = general_purpose::STANDARD.encode(&nonce);
 
     Ok((base64_ciphertext, base64_tag, base64_nonce))
+}
+
+fn decrypt_aes256_gcm(
+    key_bytes: &[u8],
+    ciphertext: &[u8],
+    tag_bytes: &[u8],
+    nonce_bytes: &[u8],
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let key = Key::<Aes256Gcm>::from_slice(key_bytes);
+    let nonce = Nonce::from_slice(nonce_bytes);
+
+    let cipher = Aes256Gcm::new(key);
+
+    let mut ciphertext_with_tag = Vec::from(ciphertext);
+    ciphertext_with_tag.extend_from_slice(tag_bytes);
+
+    let plaintext = cipher
+        .decrypt(nonce, ciphertext_with_tag.as_ref())
+        .map_err(|e| format!("AES-GCM decryption failed: {}", e))?;
+
+    Ok(plaintext)
 }
 
 fn string_to_command(s: &str, codename: &String) -> Result<Command, String> {
@@ -737,4 +665,193 @@ fn string_to_command(s: &str, codename: &String) -> Result<Command, String> {
     } else {
         return Err(String::from("Invalid command"));
     }
+}
+
+async fn mqtt_handle(
+    mqtt_broker_address: &str,
+    mqtt_broker_port: i32,
+    codename: &String,
+    background_tx: Sender<Command>,
+    mqtt_rx: &mut Receiver<MqttCommand>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client = Client::with_auto_id().expect("Failed to create Mosquitto client");
+    let subscriptions = client
+        .subscriber()
+        .expect("Failed to get subscriber handle");
+
+    let mut is_connected = false;
+    loop {
+        // Attempt to connect if not connected
+        if !is_connected {
+            println!(
+                "Attempting connection to Mosquitto at {}:{}",
+                mqtt_broker_address, mqtt_broker_port
+            );
+            match client
+                .connect(
+                    mqtt_broker_address,
+                    mqtt_broker_port,
+                    std::time::Duration::from_secs(5),
+                    None, // No user data for now
+                )
+                .await
+            {
+                Ok(_) => {
+                    is_connected = true;
+                    println!("Connection to Mosquitto successful: {:?}", is_connected);
+                    if let Err(e) = client.subscribe(TOPIC_REVOKE, QoS::ExactlyOnce).await {
+                        eprintln!("Failed to subscribe to {}: {:?}", TOPIC_REVOKE, e);
+                    }
+                    println!("{}", format!("subscribed to: {}", TOPIC_REVOKE));
+                    if let Err(e) = client
+                        .subscribe(
+                            format!("{}/+", TOPIC_BROADCAST_KEYS).as_str(),
+                            QoS::ExactlyOnce,
+                        )
+                        .await
+                    {
+                        eprintln!(
+                            "Failed to subscribe to {}: {:?}",
+                            format!("{}/+", TOPIC_BROADCAST_KEYS),
+                            e
+                        );
+                    }
+                    println!("{}", format!("subscribed to: {}/+", TOPIC_BROADCAST_KEYS));
+                    if let Err(e) = client
+                        .subscribe(
+                            format!("{}/{}", TOPIC_DM, codename).as_str(),
+                            QoS::ExactlyOnce,
+                        )
+                        .await
+                    {
+                        eprintln!(
+                            "Failed to subscribe to {}: {:?}",
+                            format!("{}/{}", TOPIC_DM, codename),
+                            e
+                        );
+                    }
+                    println!("{}", format!("subscribed to: {}/{}", TOPIC_DM, codename));
+                }
+                Err(e) => {
+                    eprintln!("Failed to connect to Mosquitto: {:?}", e);
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await; // Wait before retrying
+                    continue;
+                }
+            }
+        }
+
+        tokio::select! {
+            // Handle incoming MQTT messages
+            Ok(evt) = subscriptions.recv() => {
+                match evt {
+                    Event::Message(msg) => {
+                        if msg.topic == TOPIC_REVOKE {
+                            match serde_json::from_slice(&msg.payload) {
+                                Ok(data) => {
+                                    background_tx.send(Command::RevokeKey(data)).await.unwrap();
+                                },
+                                Err(_) => println!("Failed to parse broadcast keys json to struct"),
+                            }
+                        } else if msg.topic == format!("{}/{}", TOPIC_DM, codename) {
+                            match serde_json::from_slice(msg.payload.as_slice()) {
+                                Ok(data) => {
+                                    background_tx.send(Command::SaveMessage(data)).await.unwrap();
+                                },
+                                Err(_) => println!("Failed to parse direct message json to struct"),
+                            }
+                        } else if msg.topic.split_at(TOPIC_BROADCAST_KEYS.len()).0 == TOPIC_BROADCAST_KEYS {
+                            match serde_json::from_slice(msg.payload.as_slice()) {
+                                Ok(data) => {
+                                    background_tx.send(Command::MqttAddPublicKey(data)).await.unwrap();
+                                },
+                                Err(_) => println!("Failed to parse broadcast keys json to struct"),
+                            }
+                        }
+                        // Handle other messages here
+                    }
+                    Event::Connected(_) => {
+                        is_connected = true;
+                        println!("MQTT Client Event: Connected: {:?}", is_connected);
+                    }
+                    Event::Disconnected(reason_code) => {
+                        is_connected = false;
+                        println!("MQTT Client Event: Disconnected: {:?}. Attempting reconnect...", reason_code);
+                        // The outer loop will handle reconnection after a small delay
+                    }
+                }
+            },
+            // Handle commands from other tasks (e.g., publish requests)
+            Some(cmd) = mqtt_rx.recv() => {
+                match cmd {
+                    MqttCommand::Publish { topic, payload, qos, retain } => {
+                        if is_connected {
+                            println!("MQTT Handler: Publishing to '{}'", topic);
+                            if let Err(e) = client.publish(topic, payload, qos, retain).await {
+                                eprintln!("MQTT Handler: Failed to publish: {:?}", e);
+                                // You might send an error back to the origin if needed
+                            }
+                        } else {
+                            is_connected = false;
+                            eprintln!("MQTT Handler: Cannot publish, not connected.");
+                            // You might queue messages or send an error back
+                        }
+                    },
+                    MqttCommand::Subscribe { topic, qos } => {
+                        if is_connected {
+                            println!("MQTT Handler: Subscribing to '{}'", topic);
+                            if let Err(e) = client.subscribe(&topic, qos).await {
+                                eprintln!("MQTT Handler: Failed to subscribe: {:?}", e);
+                            }
+                        } else {
+                            is_connected = false;
+                            eprintln!("MQTT Handler: Cannot subscribe, not connected.");
+                        }
+                    },
+                }
+            },
+            else => break,
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_direct_message(
+    data: ReceivedDirectMessage,
+    state: &State,
+    target_ecdsa_pub_keys: &HashMap<String, VerifyingKey>,
+    revoked: &HashMap<String, bool>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ciphertext = general_purpose::STANDARD.decode(&data.ciphertext_b64)?;
+    let auth_tag = general_purpose::STANDARD.decode(&data.tag_autenticacao_b64)?;
+    let nonce = general_purpose::STANDARD.decode(&data.nonce_b64)?;
+    let encrypted_session_key = general_purpose::STANDARD.decode(&data.chave_sessao_cifrada_b64)?;
+    let signature_bytes = general_purpose::STANDARD.decode(&data.assinatura_b64)?;
+
+    let session_key_bytes = state
+        .rsa_key_pair
+        .skey
+        .decrypt(Oaep::new::<Sha256>(), &encrypted_session_key)?;
+
+    let plaintext_bytes = decrypt_aes256_gcm(&session_key_bytes, &ciphertext, &auth_tag, &nonce)?;
+    let plaintext = String::from_utf8(plaintext_bytes)?;
+
+    let sender_ecdsa_pkey = target_ecdsa_pub_keys
+        .get(&data.remetente)
+        .ok_or("Sender's ECDSA public key not found")?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(plaintext.as_bytes());
+    let hash_result = hasher.finalize();
+
+    let signature = Signature::from_slice(&signature_bytes)?;
+
+    sender_ecdsa_pkey.verify(&hash_result, &signature)?;
+
+    println!(
+        "\n--- New Message ---\nFrom: {}\nMessage: {}\n-------------------\n",
+        data.remetente, plaintext
+    );
+
+    Ok(())
 }
